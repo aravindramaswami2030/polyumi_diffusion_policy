@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torchvision
 import logging
 
+from diffusion_policy.model.audio.mel_audio_encoder import MelAudioEncoder
 from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 
 from diffusion_policy.common.pytorch_util import replace_submodules
@@ -78,6 +79,7 @@ class TimmObsEncoder(ModuleAttrMixin):
         
         rgb_keys = list()
         low_dim_keys = list()
+        audio_keys = list()
         key_model_map = nn.ModuleDict()
         key_transform_map = nn.ModuleDict()
         key_shape_map = dict()
@@ -160,6 +162,17 @@ class TimmObsEncoder(ModuleAttrMixin):
             elif type == 'low_dim':
                 if not attr.get('ignore_by_policy', False):
                     low_dim_keys.append(key)
+            elif type == 'audio':
+                # Contact mic. Its own encoder rather than an rgb model: the input is a raw
+                # waveform, and its leading dim is audio rows (audio_obs_horizon), not the
+                # observation horizon the image keys use.
+                audio_keys.append(key)
+                key_model_map[key] = MelAudioEncoder(
+                    samples_per_row=shape[-1],
+                    sample_rate=attr.get('sample_rate', 16000),
+                    n_mels=attr.get('n_mels', 64),
+                    out_dim=attr.get('out_dim', 128),
+                )
             else:
                 raise RuntimeError(f"Unsupported obs type: {type}")
         
@@ -167,8 +180,10 @@ class TimmObsEncoder(ModuleAttrMixin):
             
         rgb_keys = sorted(rgb_keys)
         low_dim_keys = sorted(low_dim_keys)
+        audio_keys = sorted(audio_keys)
         print('rgb keys:         ', rgb_keys)
         print('low_dim_keys keys:', low_dim_keys)
+        print('audio keys:       ', audio_keys)
 
         self.model_name = model_name
         self.shape_meta = shape_meta
@@ -177,6 +192,7 @@ class TimmObsEncoder(ModuleAttrMixin):
         self.share_rgb_model = share_rgb_model
         self.rgb_keys = rgb_keys
         self.low_dim_keys = low_dim_keys
+        self.audio_keys = audio_keys
         self.key_shape_map = key_shape_map
         self.feature_aggregation = feature_aggregation
         if model_name.startswith('vit'):
@@ -268,6 +284,14 @@ class TimmObsEncoder(ModuleAttrMixin):
             feature = self.aggregate_feature(raw_feature)
             assert len(feature.shape) == 2 and feature.shape[0] == B * T
             features.append(feature.reshape(B, -1))
+
+        # process audio input. Not reshaped to (B*T) like the image keys: the encoder consumes the
+        # whole row window at once, because the rows are contiguous in time and the onset structure
+        # a contact lives in straddles row boundaries.
+        for key in self.audio_keys:
+            data = obs_dict[key]
+            assert data.shape[0] == batch_size
+            features.append(self.key_model_map[key](data))
 
         # process lowdim input
         for key in self.low_dim_keys:

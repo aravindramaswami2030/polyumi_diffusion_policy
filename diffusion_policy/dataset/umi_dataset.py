@@ -120,6 +120,7 @@ class UmiDataset(BaseDataset):
         self.num_robot = 0
         rgb_keys = list()
         lowdim_keys = list()
+        audio_keys = list()
         key_horizon = dict()
         key_down_sample_steps = dict()
         key_latency_steps = dict()
@@ -131,6 +132,15 @@ class UmiDataset(BaseDataset):
                 rgb_keys.append(key)
             elif type == 'low_dim':
                 lowdim_keys.append(key)
+            elif type == 'audio':
+                # Rides the low-dim SAMPLING path -- it is a numeric array the sampler slices by
+                # horizon like any other -- but the model does not treat it as low-dim: the encoder
+                # reads its type from shape_meta and routes it to MelAudioEncoder rather than
+                # concatenating the raw waveform into the feature vector. Without this branch the
+                # key matches neither arm and is dropped silently, which surfaces only as a policy
+                # that ignores the contact mic.
+                lowdim_keys.append(key)
+                audio_keys.append(key)
 
             if key.endswith('eef_pos'):
                 self.num_robot += 1
@@ -189,6 +199,7 @@ class UmiDataset(BaseDataset):
         self.replay_buffer = replay_buffer
         self.rgb_keys = rgb_keys
         self.lowdim_keys = lowdim_keys
+        self.audio_keys = audio_keys
         self.key_horizon = key_horizon
         self.key_latency_steps = key_latency_steps
         self.key_down_sample_steps = key_down_sample_steps
@@ -267,6 +278,12 @@ class UmiDataset(BaseDataset):
                 this_normalizer = get_identity_normalizer_from_stat(stat)
             elif key.endswith('gripper_width'):
                 this_normalizer = get_range_normalizer_from_stat(stat)
+            elif key in self.audio_keys:
+                # Identity, not range. A waveform's 536 columns are successive time offsets, not
+                # semantic channels, so per-column min/max scaling would apply 536 unrelated gains
+                # to one signal and destroy its shape. Level is carried by the log in the mel
+                # front end instead.
+                this_normalizer = get_identity_normalizer_from_stat(stat)
             else:
                 raise RuntimeError('unsupported')
             normalizer[key] = this_normalizer
