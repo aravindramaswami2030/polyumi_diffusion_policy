@@ -113,7 +113,7 @@ shape_meta: &shape_meta
 
 task_name: &task_name polyumi_slip
 # Bind-mounted into the container by the run wrapper; override with task.dataset_path=... .
-dataset_path: /data/slip_polyumi.zarr.zip
+dataset_path: /data/dataset.zarr.zip
 pose_repr: &pose_repr
   obs_pose_repr: relative # abs or rel
   action_pose_repr: relative # abs or rel or delta
