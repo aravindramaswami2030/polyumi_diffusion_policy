@@ -256,15 +256,21 @@ class UmiDataset(BaseDataset):
                 data_cache[key] = data_cache[key].reshape(B*T, D)
 
         # action
-        assert data_cache['action'].shape[-1] % self.num_robot == 0
-        dim_a = data_cache['action'].shape[-1] // self.num_robot
-        action_normalizers = list()
-        for i in range(self.num_robot):
-            action_normalizers.append(get_range_normalizer_from_stat(array_to_stats(data_cache['action'][..., i * dim_a: i * dim_a + 3])))              # pos
-            action_normalizers.append(get_identity_normalizer_from_stat(array_to_stats(data_cache['action'][..., i * dim_a + 3: (i + 1) * dim_a - 1]))) # rot
-            action_normalizers.append(get_range_normalizer_from_stat(array_to_stats(data_cache['action'][..., (i + 1) * dim_a - 1: (i + 1) * dim_a])))  # gripper
+        if self.num_robot == 0:
+            # Gripper-only policy: the action is a single width column, so it gets the same range
+            # normalizer the gripper would have received inside the per-robot split below. The
+            # split itself cannot run -- num_robot is 0, and `% self.num_robot` would divide by zero.
+            normalizer['action'] = get_range_normalizer_from_stat(array_to_stats(data_cache['action']))
+        else:
+            assert data_cache['action'].shape[-1] % self.num_robot == 0
+            dim_a = data_cache['action'].shape[-1] // self.num_robot
+            action_normalizers = list()
+            for i in range(self.num_robot):
+                action_normalizers.append(get_range_normalizer_from_stat(array_to_stats(data_cache['action'][..., i * dim_a: i * dim_a + 3])))              # pos
+                action_normalizers.append(get_identity_normalizer_from_stat(array_to_stats(data_cache['action'][..., i * dim_a + 3: (i + 1) * dim_a - 1]))) # rot
+                action_normalizers.append(get_range_normalizer_from_stat(array_to_stats(data_cache['action'][..., (i + 1) * dim_a - 1: (i + 1) * dim_a])))  # gripper
 
-        normalizer['action'] = concatenate_normalizer(action_normalizers)
+            normalizer['action'] = concatenate_normalizer(action_normalizers)
 
         # obs
         for key in self.lowdim_keys:
@@ -409,7 +415,10 @@ class UmiDataset(BaseDataset):
             obs_dict[f'robot{robot_id}_eef_pos'] = obs_pose[:,:3]
             obs_dict[f'robot{robot_id}_eef_rot_axis_angle'] = obs_pose[:,3:]
             
-        data['action'] = np.concatenate(actions, axis=-1)
+        if self.num_robot:
+            data['action'] = np.concatenate(actions, axis=-1)
+        # else: gripper-only, and data['action'] is already the single width column the sampler
+        # built -- there is no pose to make relative, so it passes through untouched.
         
         torch_data = {
             'obs': dict_apply(obs_dict, torch.from_numpy),

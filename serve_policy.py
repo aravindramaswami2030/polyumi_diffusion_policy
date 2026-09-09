@@ -43,6 +43,7 @@ import time
 import numpy as np
 
 from polyumi_inference import ActionChunk, Observation
+from polyumi_inference.contract import AGENT_POS_CHANNEL
 from polyumi_inference.server import create_app
 
 from serve_obs import (
@@ -87,10 +88,13 @@ def _load_policy(ckpt_path: str):
 class UmiPolicyBackend:
     """Runs a trained UMI diffusion policy behind ``polyumi_inference``'s app."""
 
-    def __init__(self, policy, device: str, ckpt_path: str) -> None:
+    def __init__(self, policy, device: str, ckpt_path: str, wanted_keys: set | None = None) -> None:
         self._policy = policy
         self._device = device
         self._ckpt_path = ckpt_path
+        # Obs keys the checkpoint's own shape_meta declares; drives which optional channels
+        # predict() pulls off the wire. Empty means "visuomotor only", the pre-tactile behaviour.
+        self._wanted_keys = set(wanted_keys or ())
         # Episode-start pose (6-vec pos+rotvec), set via POST /reset. None -> current-pose fallback.
         self._demo_start_pose6 = None
 
@@ -109,8 +113,26 @@ class UmiPolicyBackend:
                 'Set -e CKPT_PATH=/data/checkpoints/<name>.ckpt and mount the checkpoint dir.'
             )
         policy, device = _load_policy(ckpt_path)
+        # Which extra channels this checkpoint wants is a property of the CHECKPOINT, read from the
+        # shape_meta it was trained with -- not a flag, and not something the client can assert.
+        # A visuomotor checkpoint must keep working unchanged when the client happens to send
+        # tactile channels, and a tactile one must refuse to run without them rather than quietly
+        # encoding whatever it finds.
+        # From the ENCODER, not the policy: DiffusionUnetTimmPolicy takes shape_meta as a
+        # constructor argument but never stores it, so asking the policy silently yields an empty
+        # set and every optional channel is dropped. The encoder's own key lists are the most
+        # direct source available -- they are literally what its forward() iterates over.
+        encoder = getattr(policy, 'obs_encoder', None)
+        wanted = (
+            set(getattr(encoder, 'rgb_keys', ()))
+            | set(getattr(encoder, 'audio_keys', ()))
+            | set(getattr(encoder, 'low_dim_keys', ()))
+        )
+        if not wanted:  # older encoder without the key lists
+            wanted = set(getattr(encoder, 'shape_meta', {}).get('obs', {}))
         logger.info('loaded policy from %s on %s', ckpt_path, device)
-        return cls(policy, device, ckpt_path)
+        logger.info('checkpoint obs keys: %s', sorted(wanted))
+        return cls(policy, device, ckpt_path, wanted)
 
     def reset(self, agent_pos: np.ndarray) -> None:
         """Cache the episode-start EEF pose. Called once at the start of each rollout."""
@@ -123,16 +145,42 @@ class UmiPolicyBackend:
             'checkpoint': self._ckpt_path,
             'device': self._device,
             'episode_start_set': self._demo_start_pose6 is not None,
+            'obs_keys': sorted(self._wanted_keys),
         }
 
     def predict(self, obs: Observation) -> ActionChunk:
         """Run the policy on one observation window and return an absolute EEF action chunk."""
         import torch
 
-        image_arr = obs['camera0_rgb']
+        # Only pulled when the checkpoint declares it: a gripper-only policy has no camera0_rgb in
+        # its shape_meta, and the client omits it from the request to save the largest array on the
+        # wire. Reading it unconditionally would KeyError before the gate below could explain why.
+        image_arr = obs['camera0_rgb'] if 'camera0_rgb' in self._wanted_keys else None
         # float64 because agent_pos_to_pose_mat builds rotations from it; the wire dtype is the
         # client's business, the precision the pose maths needs is ours.
         agent_pos = np.asarray(obs['agent_pos'], dtype=np.float64)
+
+        # Pulled only when the checkpoint declares them. Missing here is a hard error rather than a
+        # silent omission: the alternative is a KeyError from deep inside the obs encoder's forward
+        # pass, which says nothing about which side failed to hold up the contract.
+        finger_rgb = mic_0 = None
+        for key, target in (('finger_rgb', 'finger_rgb'), ('mic_0', 'mic_0')):
+            if key not in self._wanted_keys:
+                continue
+            if key not in obs:
+                raise KeyError(
+                    f'checkpoint {self._ckpt_path} was trained with {key!r} but the observation '
+                    f'does not carry it; the client has send_tactile off, or is older than this '
+                    # names(), not sorted(obs): Observation defines __getitem__ and __contains__
+                    # but no __iter__, so sorting it falls back to the legacy __getitem__(0)
+                    # protocol and dies with KeyError: 0 -- the error handler crashing instead of
+                    # reporting the error.
+                    f'checkpoint. Wire keys present: {obs.names()}'
+                )
+            if target == 'finger_rgb':
+                finger_rgb = obs[key]
+            else:
+                mic_0 = obs[key]
 
         start6 = self._demo_start_pose6
         if start6 is None:
@@ -141,7 +189,9 @@ class UmiPolicyBackend:
                 'robot0_eef_rot_axis_angle_wrt_start with the current pose'
             )
 
-        obs_np = wire_to_obs_dict(image_arr, agent_pos, demo_start_pose6=start6)
+        obs_np = wire_to_obs_dict(
+            image_arr, agent_pos, demo_start_pose6=start6, finger_rgb=finger_rgb, mic_0=mic_0
+        )
         obs_dict = {k: torch.from_numpy(v).to(self._device) for k, v in obs_np.items()}
 
         # Timed through the .cpu() call, not just predict_action: CUDA kernels launch
@@ -152,11 +202,22 @@ class UmiPolicyBackend:
         t_model = time.perf_counter()
         with torch.no_grad():
             action_pred = self._policy.predict_action(obs_dict)['action_pred']
-        action_pred = action_pred[0].detach().cpu().numpy()  # [Ta, 10] relative to current pose
+        action_pred = action_pred[0].detach().cpu().numpy()  # [Ta, 10] rel to current pose, or [Ta, 1] gripper-only
         model_ms = (time.perf_counter() - t_model) * 1e3
 
         # The current EEF pose (agent_pos[-1]) is the base the policy's chunk is relative to.
         base_pose_mat = agent_pos_to_pose_mat(agent_pos)[-1]
+
+        if action_pred.shape[-1] == 1:
+            # Gripper-only policy: it predicts width and nothing else. The wire action stays 8-wide
+            # so the client, the contract and the dummy server are all untouched -- the pose columns
+            # are filled with the CURRENT pose, i.e. "stay here". That is already what the client's
+            # gripper_only mode commands, so the two agree by construction rather than by accident;
+            # and a client without that mode still gets a hold rather than a jump to the origin.
+            abs_actions = np.repeat(agent_pos[-1:, :8], action_pred.shape[0], axis=0)
+            abs_actions[:, 7] = action_pred[:, 0]
+            return ActionChunk(abs_actions, model_ms=model_ms)
+
         # Truncation to what the client asked for is the app's; UMI's policy emits the full horizon
         # with no offset, so everything here is a legitimate action.
         return ActionChunk(actions_rel_to_abs(action_pred, base_pose_mat), model_ms=model_ms)
@@ -164,4 +225,14 @@ class UmiPolicyBackend:
 
 # from_env, not an instance: create_app calls it at startup, so a missing checkpoint is a startup
 # failure rather than a health check that passes and a rollout that 500s.
-app = create_app(UmiPolicyBackend.from_env, title='PolyUMI Inference Server')
+# required_channels is relaxed to agent_pos alone. The shared default also demands camera0_rgb,
+# which a gripper-only checkpoint neither declares nor wants -- and the client omits it there, so
+# the app-level check would reject every request before the backend saw one. The backend enforces
+# the real requirement instead, from the checkpoint's own shape_meta, and its error names the
+# missing channel and lists what the wire carried. agent_pos stays mandatory because the pose maths
+# and /reset need it regardless of which modalities a policy consumes.
+app = create_app(
+    UmiPolicyBackend.from_env,
+    title='PolyUMI Inference Server',
+    required_channels=(AGENT_POS_CHANNEL,),
+)

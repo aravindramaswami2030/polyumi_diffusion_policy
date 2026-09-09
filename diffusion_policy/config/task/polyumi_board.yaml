@@ -70,12 +70,11 @@ shape_meta: &shape_meta
       rotation_rep: rotation_6d
       ignore_by_policy: ${task.ignore_proprioception}
     finger_rgb:
-      # Native crop as exported (648x982), resized to the shared encoder input in the model.
-      # Board wiping is a visual task, so the buffer keeps full detail; `resize` is what lets that
-      # coexist with camera0_rgb, which the export pins at 224 (CAMERA0_RGB_RESOLUTION). Raise the
-      # resize later without re-exporting -- the pixels are already on disk.
-      shape: [3, 648, 982]
-      resize: [224, 224]
+      # 224x224, matching board_v1_polyumi_224.zarr.zip. The native 648x982 export exists and the
+      # encoder can resize it in-model (`resize:` in shape_meta), but the dataloader cannot carry
+      # it: at ~1.9 MB a frame, num_workers=8 and batch 64 over two rgb keys, the workers get
+      # OOM-killed -- "DataLoader worker exited unexpectedly" before the first batch.
+      shape: [3, 224, 224]
       horizon: ${task.img_obs_horizon} # int
       latency_steps: 0 # float
       down_sample_steps: ${task.obs_down_sample_steps} # int
