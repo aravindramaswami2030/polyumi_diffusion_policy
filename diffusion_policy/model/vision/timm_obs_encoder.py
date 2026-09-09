@@ -136,8 +136,16 @@ class TimmObsEncoder(ModuleAttrMixin):
             shape = tuple(attr['shape'])
             type = attr.get('type', 'low_dim')
             if type == 'rgb':
-                assert image_shape is None or image_shape == shape[1:]
-                image_shape = shape[1:]
+                # `resize` lets a key arrive at its native resolution and be brought to the shared
+                # encoder input here rather than at export. The dataset then keeps full detail on
+                # disk -- you can always downsample into the model, never the reverse -- while the
+                # backbone still sees one shape, which is what the rest of this class assumes
+                # (feature_map_shape, AttentionPool2d and spatial_embedding are all built from it).
+                effective = tuple(attr['resize']) if attr.get('resize') else shape[1:]
+                assert image_shape is None or image_shape == effective, (
+                    f"rgb key {key!r} resolves to {effective}, but another key resolves to "
+                    f"{image_shape}; give it a matching `resize` in shape_meta")
+                image_shape = effective
         if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
             assert transforms[0].type == 'RandomCrop'
             ratio = transforms[0].ratio
@@ -157,7 +165,13 @@ class TimmObsEncoder(ModuleAttrMixin):
                 this_model = model if share_rgb_model else copy.deepcopy(model)
                 key_model_map[key] = this_model
 
-                this_transform = transform
+                resize = attr.get('resize')
+                if resize:
+                    this_transform = torch.nn.Sequential(
+                        torchvision.transforms.Resize(size=tuple(resize), antialias=True), transform
+                    )
+                else:
+                    this_transform = transform
                 key_transform_map[key] = this_transform
             elif type == 'low_dim':
                 if not attr.get('ignore_by_policy', False):
@@ -172,6 +186,7 @@ class TimmObsEncoder(ModuleAttrMixin):
                     sample_rate=attr.get('sample_rate', 16000),
                     n_mels=attr.get('n_mels', 64),
                     out_dim=attr.get('out_dim', 128),
+                    f_min=attr.get('f_min', 1000.0),
                 )
             else:
                 raise RuntimeError(f"Unsupported obs type: {type}")

@@ -13,6 +13,10 @@ exact dependency tree -- adding a dependency invalidates every existing checkpoi
 a filterbank that is twenty lines.
 """
 
+# The policy container's conda env is python=3.9 (see CLAUDE.md), where `X | Y` in an annotation
+# raises at import. This makes every annotation lazy, so the 3.10+ syntax below is inert there.
+from __future__ import annotations
+
 import math
 
 import torch
@@ -55,6 +59,24 @@ class MelAudioEncoder(nn.Module):
     Three stride-2 conv blocks over the log-mel image, then global average pooling. Deliberately
     small: the slip corpus is on the order of 20k steps, and a heavier stem would fit the recording
     session rather than the contact.
+
+    ``f_min`` defaults to 20 Hz -- the full band, i.e. the raw signal. It is left there on
+    purpose: the first runs establish what the unprocessed contact mic can do, and a baseline that
+    was never trained is a number nobody has.
+
+    A higher floor is a large, measured win if you want it later. Sweeping it over 62 board contact
+    events and 43 slip events, contact SNR runs 9.4 dB unfiltered, peaks at 25.0 dB (board) /
+    22.5 dB (slip) at **300 Hz**, and falls to 18.8 / 20.3 dB by 1 kHz -- almost all of the noise
+    masking contacts is handling rumble below 300 Hz. Set ``f_min: 300.0`` in a task's ``mic_0``
+    shape_meta to turn it on; nothing else has to change and no re-export is needed.
+
+    What a higher floor does NOT buy is speech rejection, which is the tempting reason to reach for
+    one: speech spans 300-3400 Hz, so raising the floor to 1 kHz removes only its lowest sixth and
+    leaves the speech share of background energy essentially unchanged (33.7% unfiltered, 37.9% at
+    300 Hz, 32.7% at 1 kHz) while costing several dB of signal. Speech overlaps the contact band and
+    cannot be high-passed away. Separating them needs a temporal method instead -- contacts decay in
+    10-60 ms, speech syllables last 100-300 ms -- and subtracting a ~0.3 s running median per mel
+    band halved the background fluctuation in testing. Neither is applied here.
     """
 
     def __init__(
@@ -66,6 +88,7 @@ class MelAudioEncoder(nn.Module):
         hop_length: int = 160,
         out_dim: int = 128,
         log_offset: float = 1e-6,
+        f_min: float = 20.0,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -76,7 +99,7 @@ class MelAudioEncoder(nn.Module):
         self.out_dim = out_dim
         self.register_buffer('window', torch.hann_window(n_fft), persistent=False)
         self.register_buffer(
-            'fb', mel_filterbank(n_mels, n_fft, sample_rate, 20.0, sample_rate / 2), persistent=False
+            'fb', mel_filterbank(n_mels, n_fft, sample_rate, f_min, sample_rate / 2), persistent=False
         )
         self.stem = nn.Sequential(
             nn.Conv2d(1, 32, 3, stride=2, padding=1, bias=False),

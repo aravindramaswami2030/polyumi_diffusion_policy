@@ -1,14 +1,15 @@
-# Slip-control task: PolyUMI plus the two tactile streams.
+# Board task: PolyUMI plus the two tactile streams (whiteboard contact).
 #
-# Derived from task/polyumi.yaml, which stays untouched so existing visuomotor runs are
-# unaffected. Three things change:
+# Derived from task/polyumi_slip.yaml; differs only in name and finger_rgb resolution. The plain
+# visuomotor run on this same dataset uses task/polyumi.yaml unchanged -- one --type polyumi export
+# serves both, since shape_meta decides which keys a run consumes. Three things change:
 #   - finger_rgb    -> a second `rgb` key (the finger camera).
 #   - mic_0         -> the new `audio` type, encoded by MelAudioEncoder.
 #   - audio_obs_horizon, because mic_0's leading dim is audio ROWS, not observation steps.
 #
-# NOTE both rgb keys must share one spatial shape -- TimmObsEncoder asserts it, so a single
-# `image_shape` drives the transform stack. finger_rgb must therefore be exported at 224x224
-# (`output_size` in ingest/config/finger_camera.yaml), which it is not by default.
+# NOTE both rgb keys must resolve to one spatial shape -- TimmObsEncoder asserts it, since a single
+# `image_shape` drives the transform stack, feature_map_shape and AttentionPool2d. finger_rgb is
+# exported natively here and reaches that shape via `resize` in its shape_meta entry.
 # PolyUMI task config. Derived from task/umi.yaml; kept as close to it as possible so any
 # failure is our data, not a config divergence. Only three things change from umi.yaml:
 #   - name / task_name          -> polyumi
@@ -26,7 +27,7 @@
 # The *_obs_latency values are left at UMI's numbers on purpose: they are INERT while
 # dataset_frequeny: 0 (every latency_steps below multiplies by it and zeroes out). Real latency
 # compensation lives on the robot (policy_client_node) and is a separate calibration ticket.
-name: polyumi_slip
+name: polyumi_board
 
 camera_obs_latency: 0.125
 robot_obs_latency: 0.0001
@@ -69,7 +70,12 @@ shape_meta: &shape_meta
       rotation_rep: rotation_6d
       ignore_by_policy: ${task.ignore_proprioception}
     finger_rgb:
-      shape: [3, 224, 224]
+      # Native crop as exported (648x982), resized to the shared encoder input in the model.
+      # Board wiping is a visual task, so the buffer keeps full detail; `resize` is what lets that
+      # coexist with camera0_rgb, which the export pins at 224 (CAMERA0_RGB_RESOLUTION). Raise the
+      # resize later without re-exporting -- the pixels are already on disk.
+      shape: [3, 648, 982]
+      resize: [224, 224]
       horizon: ${task.img_obs_horizon} # int
       latency_steps: 0 # float
       down_sample_steps: ${task.obs_down_sample_steps} # int
@@ -114,7 +120,7 @@ shape_meta: &shape_meta
     down_sample_steps: ${task.obs_down_sample_steps} # int
     rotation_rep: rotation_6d
 
-task_name: &task_name polyumi_slip
+task_name: &task_name polyumi_board
 # Bind-mounted into the container by the run wrapper; override with task.dataset_path=... .
 dataset_path: /data/dataset.zarr.zip
 pose_repr: &pose_repr
