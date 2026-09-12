@@ -82,14 +82,24 @@ def _load_policy(ckpt_path: str):
     policy = workspace.ema_model  # EMA weights -- NOT workspace.model (eval uses EMA)
     policy.to(device)
     policy.eval()
-    return policy, device
+    # How this checkpoint's gripper action is expressed. Read from the checkpoint rather than a
+    # serve-time flag: the answer is a property of the training run, and a flag that disagrees
+    # with it is a silent offset on every command, not an error anyone would see.
+    gripper_repr = 'abs'
+    try:
+        gripper_repr = cfg.task.pose_repr.get('action_gripper_repr', 'abs')
+    except Exception:
+        pass
+    return policy, device, gripper_repr
 
 
 class UmiPolicyBackend:
     """Runs a trained UMI diffusion policy behind ``polyumi_inference``'s app."""
 
-    def __init__(self, policy, device: str, ckpt_path: str, wanted_keys: set | None = None) -> None:
+    def __init__(self, policy, device: str, ckpt_path: str, wanted_keys: set | None = None,
+                 gripper_repr: str = 'abs') -> None:
         self._policy = policy
+        self._gripper_repr = gripper_repr
         self._device = device
         self._ckpt_path = ckpt_path
         # Obs keys the checkpoint's own shape_meta declares; drives which optional channels
@@ -112,7 +122,7 @@ class UmiPolicyBackend:
                 f'CKPT_PATH must point to a checkpoint file; got {ckpt_path!r}. '
                 'Set -e CKPT_PATH=/data/checkpoints/<name>.ckpt and mount the checkpoint dir.'
             )
-        policy, device = _load_policy(ckpt_path)
+        policy, device, gripper_repr = _load_policy(ckpt_path)
         # Which extra channels this checkpoint wants is a property of the CHECKPOINT, read from the
         # shape_meta it was trained with -- not a flag, and not something the client can assert.
         # A visuomotor checkpoint must keep working unchanged when the client happens to send
@@ -132,7 +142,7 @@ class UmiPolicyBackend:
             wanted = set(getattr(encoder, 'shape_meta', {}).get('obs', {}))
         logger.info('loaded policy from %s on %s', ckpt_path, device)
         logger.info('checkpoint obs keys: %s', sorted(wanted))
-        return cls(policy, device, ckpt_path, wanted)
+        return cls(policy, device, ckpt_path, wanted, gripper_repr)
 
     def reset(self, agent_pos: np.ndarray) -> None:
         """Cache the episode-start EEF pose. Called once at the start of each rollout."""
@@ -192,7 +202,17 @@ class UmiPolicyBackend:
         obs_np = wire_to_obs_dict(
             image_arr, agent_pos, demo_start_pose6=start6, finger_rgb=finger_rgb, mic_0=mic_0
         )
-        obs_dict = {k: torch.from_numpy(v).to(self._device) for k, v in obs_np.items()}
+        # Keep only what this checkpoint was trained on. wire_to_obs_dict always builds the full
+        # visuomotor set (poses, rot6d, wrt_start, gripper) because the wire carries agent_pos
+        # regardless; a gripper-only policy's normalizer has no entry for the pose keys, and
+        # LinearNormalizer raises AttributeError on the first one it does not recognise rather
+        # than ignoring it. Filtering here keeps that contract in one place instead of teaching
+        # wire_to_obs_dict about every policy shape.
+        obs_dict = {
+            k: torch.from_numpy(v).to(self._device)
+            for k, v in obs_np.items()
+            if not self._wanted_keys or k in self._wanted_keys
+        }
 
         # Timed through the .cpu() call, not just predict_action: CUDA kernels launch
         # asynchronously, so stopping the clock at the end of the `with` block would measure
@@ -215,7 +235,13 @@ class UmiPolicyBackend:
             # gripper_only mode commands, so the two agree by construction rather than by accident;
             # and a client without that mode still gets a hold rather than a jump to the origin.
             abs_actions = np.repeat(agent_pos[-1:, :8], action_pred.shape[0], axis=0)
-            abs_actions[:, 7] = action_pred[:, 0]
+            if self._gripper_repr == 'relative':
+                # The policy predicted a CHANGE from the width it was conditioned on, which is
+                # agent_pos[-1, 7] -- the same base UmiDataset subtracted at training time. The
+                # wire stays absolute, so the conversion belongs here rather than in the client.
+                abs_actions[:, 7] = agent_pos[-1, 7] + action_pred[:, 0]
+            else:
+                abs_actions[:, 7] = action_pred[:, 0]
             return ActionChunk(abs_actions, model_ms=model_ms)
 
         # Truncation to what the client asked for is the app's; UMI's policy emits the full horizon
