@@ -62,6 +62,30 @@ from serve_obs import (
 logger = logging.getLogger('uvicorn.error').getChild('serve_policy')
 
 
+def _sync_batchnorm_stats(source, target) -> int:
+    """
+    Copy BatchNorm running statistics from ``source`` into ``target``; return how many layers.
+
+    ``EMAModel.step`` averages parameters only, so the EMA copy's ``running_mean``/``running_var``
+    never track the data the way the trained model's do. In eval mode those buffers *are* the
+    normalization, so serving the EMA weights unsynced feeds every later layer activations at the
+    wrong scale. Validation runs ``workspace.model``, so val_loss never sees it.
+    """
+    import torch
+
+    source_modules = dict(source.named_modules())
+    n_synced = 0
+    with torch.no_grad():
+        for name, module in target.named_modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm) and module.track_running_stats:
+                src = source_modules[name]
+                module.running_mean.copy_(src.running_mean)
+                module.running_var.copy_(src.running_var)
+                module.num_batches_tracked.copy_(src.num_batches_tracked)
+                n_synced += 1
+    return n_synced
+
+
 def _load_policy(ckpt_path: str):
     """
     Load the dill-pickled, self-describing checkpoint.
@@ -80,6 +104,9 @@ def _load_policy(ckpt_path: str):
     workspace = hydra.utils.get_class(cfg._target_)(cfg)
     workspace.load_payload(payload)
     policy = workspace.ema_model  # EMA weights -- NOT workspace.model (eval uses EMA)
+    n_bn = _sync_batchnorm_stats(workspace.model, policy)
+    if n_bn:
+        logger.info('synced BatchNorm running stats into the EMA weights (%d layers)', n_bn)
     policy.to(device)
     policy.eval()
     # How this checkpoint's gripper action is expressed. Read from the checkpoint rather than a
