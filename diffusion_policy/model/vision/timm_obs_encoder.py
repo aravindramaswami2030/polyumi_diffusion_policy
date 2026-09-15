@@ -146,14 +146,22 @@ class TimmObsEncoder(ModuleAttrMixin):
                     f"rgb key {key!r} resolves to {effective}, but another key resolves to "
                     f"{image_shape}; give it a matching `resize` in shape_meta")
                 image_shape = effective
-        if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
-            assert transforms[0].type == 'RandomCrop'
-            ratio = transforms[0].ratio
-            transforms = [
-                torchvision.transforms.RandomCrop(size=int(image_shape[0] * ratio)),
-                torchvision.transforms.Resize(size=image_shape[0], antialias=True)
-            ] + transforms[1:]
-        transform = nn.Identity() if transforms is None else torch.nn.Sequential(*transforms)
+        # image_shape is None whenever shape_meta has no rgb key at all (an audio-only or
+        # low_dim-only obs set) -- the crop/resize sizing below only means anything for an image,
+        # so skip it entirely rather than index None. `transform` still needs a value: the loop
+        # below only ever attaches it to an rgb key's entry in key_transform_map, so on this path
+        # it is built but never actually applied to anything.
+        if image_shape is not None:
+            if transforms is not None and not isinstance(transforms[0], torch.nn.Module):
+                assert transforms[0].type == 'RandomCrop'
+                ratio = transforms[0].ratio
+                transforms = [
+                    torchvision.transforms.RandomCrop(size=int(image_shape[0] * ratio)),
+                    torchvision.transforms.Resize(size=image_shape[0], antialias=True)
+                ] + transforms[1:]
+            transform = nn.Identity() if transforms is None else torch.nn.Sequential(*transforms)
+        else:
+            transform = nn.Identity()
 
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr['shape'])
@@ -191,7 +199,12 @@ class TimmObsEncoder(ModuleAttrMixin):
             else:
                 raise RuntimeError(f"Unsupported obs type: {type}")
         
-        feature_map_shape = [x // downsample_ratio for x in image_shape]
+        # Only meaningful with at least one rgb key; unused downstream when there is none (a ViT
+        # backbone forces feature_aggregation to None a few lines below, and every other
+        # aggregation branch that reads it is keyed off an rgb-only feature_aggregation setting).
+        feature_map_shape = (
+            [x // downsample_ratio for x in image_shape] if image_shape is not None else None
+        )
             
         rgb_keys = sorted(rgb_keys)
         low_dim_keys = sorted(low_dim_keys)
